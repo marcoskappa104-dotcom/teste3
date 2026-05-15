@@ -99,6 +99,12 @@ namespace RPG.Data
         public bool IsEquipment  => Type == ItemType.Equipment && EquipSlot != EquipmentSlot.None;
         public bool IsConsumable => Type == ItemType.Consumable && (HealAmount > 0f || ManaAmount > 0f);
 
+        /// <summary>
+        /// True para tipos que podem se acumular em pilha (Consumable e Misc).
+        /// PowerGems e equipamentos são sempre quantidade 1.
+        /// </summary>
+        public bool IsStackable  => Type == ItemType.Consumable || Type == ItemType.Misc;
+
         public Color RarityColor => Rarity switch
         {
             ItemRarity.Common    => new Color(0.8f, 0.8f, 0.8f),
