@@ -24,17 +24,25 @@ namespace RPG.Data
     /// ScriptableObject que define um item do jogo.
     /// O ItemId é a chave de banco — NUNCA altere após o item estar em uso por jogadores.
     ///
-    /// === MUDANÇAS DESTA VERSÃO ===
+    /// === MUDANÇAS DESTA VERSÃO (sistema de stacking) ===
     ///
-    ///   ARMAS AGORA TÊM PERFIL DE ATAQUE BÁSICO:
-    ///   - WeaponType define a categoria (Sword/Bow/Staff/etc).
-    ///   - UseCustomAttackProfile + CustomAttackProfile permite override
-    ///     fino por item (ex: arco lendário com range maior).
-    ///   - GetEffectiveAttackProfile() é o que o BasicAttackSystem consulta.
+    ///   1. MaxStackSize CONFIGURÁVEL POR ITEM:
+    ///      Cada Consumable/Misc define quanto pode empilhar em um único slot.
+    ///      Defaults sensatos: poções 99, materiais 999.
+    ///      0 = usa o default global do tipo (ver DEFAULT_STACK_CONSUMABLE/MISC).
+    ///
+    ///   2. EffectiveMaxStack PROPERTY:
+    ///      Resolve o stack máximo efetivo (custom OU default), retornando 1
+    ///      para itens não-stackable (defesa em profundidade).
     /// </summary>
     [CreateAssetMenu(menuName = "RPG/Item Data", fileName = "Item_New")]
     public class ItemData : ScriptableObject
     {
+        // ── Defaults globais de stack ──────────────────────────────────────
+        public const int DEFAULT_STACK_CONSUMABLE = 99;
+        public const int DEFAULT_STACK_MISC       = 999;
+        public const int MAX_STACK_HARD_CAP       = 9999; // sanity cap absoluto
+
         // ── Identificação ──────────────────────────────────────────────────
         [Header("Identificação")]
         [Tooltip("ID único e estável. NUNCA altere após criar personagens com este item.")]
@@ -55,6 +63,12 @@ namespace RPG.Data
         [Tooltip("Peso de drop relativo. 100 = comum, 1 = raríssimo.")]
         [Range(0, 100)]
         public int DropWeight = 10;
+
+        [Header("Stacking (Consumable / Misc)")]
+        [Tooltip("Quantos podem empilhar em um slot. 0 = usa default do tipo " +
+                 "(Consumable=99, Misc=999). Ignorado para Equipment/PowerGem.")]
+        [Range(0, MAX_STACK_HARD_CAP)]
+        public int MaxStackSize = 0;
 
         // ── PowerGem ───────────────────────────────────────────────────────
         [Header("PowerGem (use apenas se Type == PowerGem)")]
@@ -125,11 +139,34 @@ namespace RPG.Data
         public bool IsStackable  => Type == ItemType.Consumable || Type == ItemType.Misc;
 
         /// <summary>
+        /// Stack máximo efetivo. Para Equipment/PowerGem retorna 1 (não empilháveis).
+        /// Para Consumable/Misc retorna MaxStackSize se configurado, senão o default
+        /// global do tipo.
+        /// </summary>
+        public int EffectiveMaxStack
+        {
+            get
+            {
+                if (!IsStackable) return 1;
+                if (MaxStackSize > 0) return Mathf.Min(MaxStackSize, MAX_STACK_HARD_CAP);
+                return Type == ItemType.Consumable
+                    ? DEFAULT_STACK_CONSUMABLE
+                    : DEFAULT_STACK_MISC;
+            }
+        }
+
+        /// <summary>
+        /// True se este consumível restaura HP de fato (positivo e > 0).
+        /// </summary>
+        public bool RestoresHP => Type == ItemType.Consumable && HealAmount > 0f;
+
+        /// <summary>
+        /// True se este consumível restaura MP de fato (positivo e > 0).
+        /// </summary>
+        public bool RestoresMP => Type == ItemType.Consumable && ManaAmount > 0f;
+
+        /// <summary>
         /// Retorna o perfil de ataque básico efetivo para esta arma.
-        /// Se UseCustomAttackProfile = true, retorna o custom; caso contrário,
-        /// o perfil padrão da categoria WeaponType.
-        ///
-        /// Se o item NÃO é arma, retorna o perfil de Unarmed (defensivo).
         /// </summary>
         public WeaponAttackProfile GetEffectiveAttackProfile()
         {
@@ -204,10 +241,21 @@ namespace RPG.Data
 
             if (MaxDurability < 0) MaxDurability = 0;
 
-            // Aviso se uma arma esquecer de configurar WeaponType
+            // Avisa se a arma esquecer de configurar WeaponType
             if (IsWeapon && WeaponType == WeaponType.Unarmed)
                 Debug.LogWarning($"[ItemData] '{name}' é arma mas WeaponType=Unarmed. " +
                                  "Você quis configurar Sword/Bow/Staff/etc?");
+
+            // Avisa se item não-stackable tiver MaxStackSize configurado
+            if (!IsStackable && MaxStackSize > 0)
+                Debug.LogWarning($"[ItemData] '{name}' não é stackable mas MaxStackSize está configurado. " +
+                                 "Será ignorado.");
+
+            // Clampa cap absoluto
+            if (MaxStackSize > MAX_STACK_HARD_CAP)
+                MaxStackSize = MAX_STACK_HARD_CAP;
+            if (MaxStackSize < 0)
+                MaxStackSize = 0;
         }
 #endif
     }
