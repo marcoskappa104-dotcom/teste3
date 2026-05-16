@@ -11,11 +11,10 @@ namespace RPG.UI
     /// <summary>
     /// ItemTooltipUI — tooltip com seções dinâmicas.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (sistema de armas) ===
-    ///   - Nova seção "Arma" exibida para itens com IsWeapon = true.
-    ///     Mostra: tipo (Espada/Arco/Cajado), range, físico/mágico,
-    ///     multiplicador de dano, custo de mana (se houver).
-    ///   - O StringBuilder compartilhado continua sendo reutilizado.
+    /// === MUDANÇAS DESTA VERSÃO (sistema de stacking) ===
+    ///   - Consumable section agora mostra "Empilha até X" para deixar
+    ///     claro o tamanho do stack.
+    ///   - Adicionada linha de stack info para itens Misc também.
     /// </summary>
     public class ItemTooltipUI : MonoBehaviour
     {
@@ -31,7 +30,6 @@ namespace RPG.UI
         [SerializeField] private TMP_Text _descriptionText;
 
         [Header("Seção de Arma (Equipment + IsWeapon)")]
-        [Tooltip("Opcional. Se nulo, info de arma vai pro statsSection.")]
         [SerializeField] private GameObject _weaponSection;
         [SerializeField] private TMP_Text   _weaponText;
 
@@ -120,7 +118,7 @@ namespace RPG.UI
             ShowStatsSection(item);
             ShowRequirementsSection(item);
             ShowSkillSection(item);
-            ShowConsumableSection(item);
+            ShowConsumableOrMiscSection(item);
         }
 
         private void ApplyVisibility(bool visible)
@@ -134,18 +132,14 @@ namespace RPG.UI
             gameObject.SetActive(visible);
         }
 
-        // ── Arma (nova seção) ──────────────────────────────────────────────
+        // ── Arma ───────────────────────────────────────────────────────────
 
         private void ShowWeaponSection(ItemData item)
         {
-            // Se o painel dedicado não existir, integra no statsSection
             GameObject target = _weaponSection;
             TMP_Text   label  = _weaponText;
             if (target == null)
             {
-                // Sem painel dedicado — não exibe seção própria.
-                // (Pode-se mesclar no _statsText, mas para evitar string mixing
-                // deixamos só o painel dedicado.)
                 if (_weaponSection != null) _weaponSection.SetActive(false);
                 return;
             }
@@ -167,14 +161,12 @@ namespace RPG.UI
 
             _sharedSB.AppendLine($"Alcance: {profile.Range:0.#}m");
 
-            // Multiplicador de dano só vale a pena mostrar se != 1
             if (!Mathf.Approximately(profile.DamageMultiplier, 1f))
             {
                 string mod = profile.DamageMultiplier > 1f ? "#88FF88" : "#FFB870";
                 _sharedSB.AppendLine($"<color={mod}>Dano: {profile.DamageMultiplier:0.##}×</color>");
             }
 
-            // Velocidade só se notavelmente diferente
             if (profile.AttackIntervalMultiplier < 0.95f)
                 _sharedSB.AppendLine("<color=#88FF88>Velocidade: rápido</color>");
             else if (profile.AttackIntervalMultiplier > 1.1f)
@@ -357,25 +349,46 @@ namespace RPG.UI
             _skillSection.SetActive(true);
         }
 
-        // ── Consumível ─────────────────────────────────────────────────────
+        // ── Consumível / Misc ──────────────────────────────────────────────
 
-        private void ShowConsumableSection(ItemData item)
+        /// <summary>
+        /// Reaproveita o consumable section para mostrar info de stack
+        /// também em itens Misc (já que ambos são stackable). Para
+        /// Consumable mostra HP/MP/duração + tamanho do stack; para Misc
+        /// mostra só o tamanho do stack.
+        /// </summary>
+        private void ShowConsumableOrMiscSection(ItemData item)
         {
             if (_consumableSection == null) return;
 
-            if (!item.IsConsumable) { _consumableSection.SetActive(false); return; }
-
+            bool showSection = false;
             _sharedSB.Clear();
-            if (item.HealAmount > 0f)   _sharedSB.AppendLine($"<color=#66FF66>+{item.HealAmount:0} HP</color>");
-            if (item.ManaAmount > 0f)   _sharedSB.AppendLine($"<color=#66AAFF>+{item.ManaAmount:0} MP</color>");
-            if (item.BuffDuration > 0f) _sharedSB.AppendLine($"Duração: {item.BuffDuration:0.#}s");
+
+            if (item.IsConsumable)
+            {
+                if (item.HealAmount > 0f)
+                    _sharedSB.AppendLine($"<color=#66FF66>+{item.HealAmount:0} HP</color>");
+                if (item.ManaAmount > 0f)
+                    _sharedSB.AppendLine($"<color=#66AAFF>+{item.ManaAmount:0} MP</color>");
+                if (item.BuffDuration > 0f)
+                    _sharedSB.AppendLine($"Duração: {item.BuffDuration:0.#}s");
+                showSection = _sharedSB.Length > 0;
+            }
+
+            // Info de stack — tanto para Consumable quanto Misc
+            if (item.IsStackable)
+            {
+                if (_sharedSB.Length > 0) _sharedSB.AppendLine();
+                _sharedSB.Append($"<color=#AAAAAA>Empilha até {item.EffectiveMaxStack}</color>");
+                showSection = true;
+            }
 
             if (_consumableText != null) _consumableText.text = _sharedSB.ToString().TrimEnd();
-            _consumableSection.SetActive(_sharedSB.Length > 0);
+            _consumableSection.SetActive(showSection);
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Posicionamento (inalterado)
+        // Posicionamento
         // ══════════════════════════════════════════════════════════════════
 
         private void PositionByAnchor(RectTransform anchor)
