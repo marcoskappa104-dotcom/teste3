@@ -15,34 +15,27 @@ namespace RPG.Network
     /// <summary>
     /// Monstro com IA e combate server-authoritative.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (Lote 3 — robustez de morte/fade) ===
+    /// === MUDANÇAS DESTA VERSÃO (sistema de armas) ===
     ///
-    ///   1. RpcOnDied SAFE PARA SERVIDOR DEDICADO:
-    ///      Antes, o método acessava NetworkClient.localPlayer e
-    ///      FloatingTextManager.Instance diretamente, o que disparava
-    ///      warnings/null refs em servidor dedicado puro (sem cliente).
-    ///      Agora, o método é early-return em Application.isBatchMode.
+    ///   1. CmdBasicAttack AGORA CONSULTA O PERFIL DE ARMA SERVER-SIDE:
+    ///      Em vez de confiar no clientAttackRange, o servidor lê o item
+    ///      no slot Weapon do NetworkInventory, resolve o perfil efetivo,
+    ///      e usa o range/multiplicador/damage type do perfil REAL.
+    ///      O parâmetro clientAttackRange é mantido como informação de
+    ///      intenção (anti-cheat: cap = min(clientRange, profileRange)).
     ///
-    ///   2. FADE DE MATERIAIS MAIS ROBUSTO:
-    ///      O fade lia r.materials (que CRIA cópia das instâncias, sempre)
-    ///      e depois fazia r.materials = mats. As cópias originais ficavam
-    ///      órfãs até serem GC'd. Agora, tracking explícito em
-    ///      _fadeMaterialInstances é a única referência e o cleanup é
-    ///      garantido até em destruição prematura via OnDisable.
+    ///   2. PROJÉTEIS QUANDO ARMA RANGED:
+    ///      Se profile.UsesProjectile, o servidor spawna um Projectile via
+    ///      Projectile.ServerSpawnFromPlayerAttack (chamado aqui inline).
+    ///      O Projectile carrega o dano JÁ CALCULADO e aplica no impacto
+    ///      via ServerTakeProjectileDamage.
     ///
-    ///   3. CLEANUP EM OnDisable:
-    ///      Antes, se o monstro fosse despawnado durante o fade (ex: jogador
-    ///      saiu da AOI), o fade ficava órfão. Agora, OnDisable cancela
-    ///      coroutines e libera materiais.
+    ///   3. CUSTO DE MANA NO BÁSICO:
+    ///      Se profile.ManaCost > 0 (cajado/varinha), valida MP e consome
+    ///      antes de aplicar dano. Se faltar mana, rejeita o ataque.
     ///
-    ///   4. PHYSICS NON-ALLOC EM TryAggro:
-    ///      Substituído Physics.OverlapSphere (aloca array) por
-    ///      Physics.OverlapSphereNonAlloc com buffer pré-alocado. Em mapas
-    ///      com muitos monstros agressivos isso gera muito menos GC pressure.
-    ///
-    ///   5. _damageLog COM TIMESTAMP:
-    ///      Já havia cleanup periódico, mas agora ele é mais agressivo —
-    ///      remove entradas órfãs antes mesmo do timer.
+    ///   4. PROJECTILE PREFAB:
+    ///      Referenciado via RPGNetworkManager.GetProjectilePrefab(WeaponType).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -104,10 +97,14 @@ namespace RPG.Network
         [SerializeField] private MonsterHealthBarUI healthBarUI;
         [SerializeField] private GameObject         visualRoot;
 
+        [Header("Projétil de impacto (ponto de spawn)")]
+        [Tooltip("Onde projéteis miram (centro de massa do monstro).")]
+        [SerializeField] private Transform projectileImpactPoint;
+
         // ── Constantes server-side ─────────────────────────────────────────
         private const float ATTACK_RANGE_TOLERANCE         = 1.15f;
         private const float CHASE_DEST_FRACTION            = 0.82f;
-        private const float SERVER_MAX_PLAYER_ATTACK_RANGE = 6f;
+        private const float SERVER_MAX_PLAYER_ATTACK_RANGE = 30f; // permite arco/cajado long range
         private const float REGEN_INTERVAL                 = 5f;
         private const float REGEN_PERCENT                  = 0.05f;
         private const float MOVING_UPDATE_INTERVAL         = 0.1f;
@@ -126,6 +123,11 @@ namespace RPG.Network
         public float   MaxHP       => _maxHP;
         public bool    IsDead      => _isDead;
         public Vector3 Position    => transform.position;
+
+        /// <summary>Ponto onde projéteis devem impactar (centro do monstro).</summary>
+        public Vector3 ImpactPoint => projectileImpactPoint != null
+            ? projectileImpactPoint.position
+            : transform.position + Vector3.up * 1f;
 
         public void OnSelected()   { if (selectionIndicator) selectionIndicator.SetActive(true);  }
         public void OnDeselected() { if (selectionIndicator) selectionIndicator.SetActive(false); }
@@ -158,12 +160,10 @@ namespace RPG.Network
         private WaitForSeconds _pathUpdateWait;
         private WaitForSeconds _regenWait;
 
-        // Buffer reutilizado para Physics non-alloc (evita GC pressure)
         private Collider[] _aggroOverlapBuffer;
 
         private float _lastIsMovingUpdateTime;
 
-        // Coroutines rastreadas explicitamente
         private Coroutine _aggroScanCoroutine;
         private Coroutine _pathUpdateCoroutine;
         private Coroutine _patrolWaitCoroutine;
@@ -172,7 +172,6 @@ namespace RPG.Network
 
         private bool _deathProcessed;
 
-        // Visual de morte
         private Coroutine      _clientFadeCoroutine;
         private List<Material> _fadeMaterialInstances;
 
@@ -224,7 +223,6 @@ namespace RPG.Network
 
         private void OnDisable()
         {
-            // Cleanup ao despawnar (ex: jogador saiu da AOI, troca de cena)
             if (_clientFadeCoroutine != null)
             {
                 StopCoroutine(_clientFadeCoroutine);
@@ -322,7 +320,6 @@ namespace RPG.Network
                 if (moving != _isMoving) _isMoving = moving;
             }
 
-            // Cleanup periódico do _damageLog (combates muito longos)
             if (Time.time - _lastDamageLogCleanupTime >= DAMAGE_LOG_CLEANUP_INTERVAL)
             {
                 _lastDamageLogCleanupTime = Time.time;
@@ -342,13 +339,6 @@ namespace RPG.Network
             }
         }
 
-        /// <summary>
-        /// Remove entradas do _damageLog para jogadores que:
-        ///   - Não existem mais no NetworkServer.spawned (desconectaram)
-        ///   - Estão MUITO fora do leash (não vão receber XP mesmo se o monstro morrer)
-        ///
-        /// Mantém o log compacto em combates muito longos.
-        /// </summary>
         [Server]
         private void CleanupOrphanedDamageEntries()
         {
@@ -375,8 +365,6 @@ namespace RPG.Network
                     else if (!np.Dead
                              && Vector3.Distance(np.transform.position, transform.position) > maxDist)
                     {
-                        // Players mortos são mantidos — podem respawnar e ainda
-                        // têm direito a XP. Mas players VIVOS e muito longe são órfãos.
                         orphaned = true;
                     }
                 }
@@ -394,7 +382,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Coroutines de IA
+        // Coroutines de IA (inalteradas)
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
@@ -465,7 +453,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Estados de IA
+        // Estados de IA (inalterados)
         // ══════════════════════════════════════════════════════════════════
 
         private void ServerPatrolWaypoints()
@@ -574,10 +562,6 @@ namespace RPG.Network
             }
         }
 
-        // ══════════════════════════════════════════════════════════════════
-        // Path updates
-        // ══════════════════════════════════════════════════════════════════
-
         [Server]
         private void UpdateChasePath()
         {
@@ -642,10 +626,6 @@ namespace RPG.Network
                 _patrolTargetSet = true;
             }
         }
-
-        // ══════════════════════════════════════════════════════════════════
-        // Aggro — usa OverlapSphereNonAlloc (zero alocação)
-        // ══════════════════════════════════════════════════════════════════
 
         [Server]
         private void TryAggro()
@@ -725,7 +705,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Ataque do monstro
+        // Ataque do monstro contra o jogador
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
@@ -788,7 +768,31 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Commands de ataque recebidos do cliente
+        // Recebimento de dano POR PROJÉTIL
+        // ══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Chamado pelo Projectile no impacto. O dano já foi calculado quando
+        /// o projétil foi disparado — aqui só aplicamos e mostramos VFX.
+        ///
+        /// Como o atacante já está fora de cena lógica (não conseguimos saber
+        /// se ele continua aggro), creditamos o dano ao próprio Projectile.
+        /// Damage log usa um shooter netId armazenado no Projectile.
+        /// </summary>
+        [Server]
+        public void ServerTakeProjectileDamage(float dmg, bool crit)
+        {
+            if (_isDead || _deathProcessed) return;
+
+            dmg = SanitizeDamage(dmg);
+            dmg = Mathf.Max(1f, dmg);
+
+            RpcShowDamage(dmg, crit, ImpactPoint);
+            ApplyDamageInternal(dmg);
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // CmdRequestSkill (inalterado, mas mantido aqui para referência)
         // ══════════════════════════════════════════════════════════════════
 
         [Command(requiresAuthority = false)]
@@ -838,11 +842,10 @@ namespace RPG.Network
             attacker.RpcSkillConfirmed(skillIndex, skill.Cooldown);
         }
 
-        /// <summary>
-        /// Ataque básico. Usa chave de cooldown long ESTRUTURADA para garantir
-        /// unicidade entre (atacante, monstro) sem risco de colisão com índices
-        /// de skill.
-        /// </summary>
+        // ══════════════════════════════════════════════════════════════════
+        // CmdBasicAttack — agora consulta o perfil de arma server-side
+        // ══════════════════════════════════════════════════════════════════
+
         [Command(requiresAuthority = false)]
         public void CmdBasicAttack(uint attackerNetId, float clientAttackRange)
         {
@@ -860,55 +863,171 @@ namespace RPG.Network
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
 
-            float serverAttackRange = Mathf.Clamp(clientAttackRange, 0.5f, SERVER_MAX_PLAYER_ATTACK_RANGE);
-            float dist              = Vector3.Distance(attacker.transform.position, transform.position);
-            float maxAllowedRange   = serverAttackRange * ATTACK_RANGE_TOLERANCE;
+            // === RESOLVE O PERFIL DE ARMA NO SERVIDOR ===
+            // Cliente não dita range/multiplicador/tipo — apenas envia a intenção.
+            // O servidor decide tudo baseado no item REAL equipado.
+            var inventory = attacker.GetComponent<NetworkInventory>();
+            WeaponAttackProfile profile = ResolveServerWeaponProfile(inventory);
+
+            // Anti-cheat: cliente não pode reportar range maior que o real do perfil.
+            // Aceitamos o menor entre cliente e servidor (defesa em profundidade).
+            float serverRange = profile.Range;
+            float effectiveRange = Mathf.Min(
+                Mathf.Clamp(clientAttackRange, 0.5f, SERVER_MAX_PLAYER_ATTACK_RANGE),
+                serverRange);
+
+            float dist            = Vector3.Distance(attacker.transform.position, transform.position);
+            float maxAllowedRange = effectiveRange * ATTACK_RANGE_TOLERANCE;
 
             if (dist > maxAllowedRange)
             {
                 Debug.LogWarning($"[Security] {attacker.CharacterName} atacou fora de range: " +
-                                 $"dist={dist:0.2f} max={maxAllowedRange:0.2f}");
+                                 $"dist={dist:0.2f} max={maxAllowedRange:0.2f} (perfil={profile.Type})");
                 return;
             }
 
+            // Cooldown: 1/ASPD escalado pelo multiplier da arma
             long cooldownKey = BuildBasicAttackCooldownKey(attacker.netId, netId);
-            float attackInterval = atkStats.ASPD > 0f ? (1f / atkStats.ASPD) : 1.2f;
-            attackInterval = Mathf.Clamp(attackInterval, 0.2f, 3f);
+            float baseInterval = atkStats.ASPD > 0f ? (1f / atkStats.ASPD) : 1.2f;
+            float attackInterval = Mathf.Clamp(
+                baseInterval * profile.AttackIntervalMultiplier, 0.2f, 3f);
 
             if (!attacker.ServerCheckAndSetCooldownLong(cooldownKey, attackInterval)) return;
 
-            bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
-            if (!hit) { RpcShowMiss(transform.position); return; }
+            // Custo de mana (cajado/varinha)
+            if (profile.ManaCost > 0f)
+            {
+                if (attacker.CurrentMP < profile.ManaCost)
+                {
+                    attacker.RpcShowMessageToOwner("MP insuficiente para atacar!");
+                    return;
+                }
+                attacker.ServerConsumeMP(profile.ManaCost);
+            }
 
+            // Roll de acerto
+            bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
+            if (!hit)
+            {
+                if (profile.UsesProjectile)
+                {
+                    // Mesmo errando, lança o projétil (para feedback visual);
+                    // o miss flutua no alvo no impacto. Para simplicidade aqui,
+                    // mostramos miss no alvo IMEDIATAMENTE e não spawnamos projétil.
+                    // (Spawnar e fazer "miss visual" no impacto exigiria flag no Projectile.)
+                }
+                RpcShowMiss(transform.position);
+                return;
+            }
+
+            // Calcula dano (físico ou mágico) com multiplicador da arma
             bool  crit = StatsCalculator.RollCrit(atkStats.CRIT);
-            float dmg  = StatsCalculator.CalculatePhysicalDamage(
-                atkStats.ATK,
-                _stats.DEF,
-                crit,
-                atkStats.CritDMG,
-                atkStats.Penetration,
-                _stats.DamageReduction);
+            float dmg;
+
+            if (profile.IsPhysical)
+            {
+                dmg = StatsCalculator.CalculatePhysicalDamage(
+                    atkStats.ATK * profile.DamageMultiplier,
+                    _stats.DEF,
+                    crit,
+                    atkStats.CritDMG,
+                    atkStats.Penetration,
+                    _stats.DamageReduction);
+            }
+            else
+            {
+                dmg = StatsCalculator.CalculateMagicDamage(
+                    atkStats.MATK * profile.DamageMultiplier,
+                    _stats.MDEF,
+                    crit,
+                    atkStats.CritDMG,
+                    atkStats.MagicPenetration,
+                    _stats.DamageReduction);
+            }
 
             dmg = SanitizeDamage(dmg);
             dmg = Mathf.Max(1f, dmg);
 
+            // Damage log para distribuir XP
             if (!_damageLog.ContainsKey(attacker.netId)) _damageLog[attacker.netId] = 0f;
             _damageLog[attacker.netId] += dmg;
 
-            RpcShowDamage(dmg, crit, transform.position);
+            // Aggro reaction roda independente de melee/ranged
             ApplyAggroReaction(attacker);
-            ApplyDamageInternal(dmg);
+
+            if (profile.UsesProjectile)
+            {
+                // Ranged: spawn do projétil. Dano só aplica no impacto.
+                SpawnAttackProjectile(attacker, profile, dmg, crit);
+            }
+            else
+            {
+                // Melee: dano instantâneo
+                RpcShowDamage(dmg, crit, ImpactPoint);
+                ApplyDamageInternal(dmg);
+            }
         }
 
         /// <summary>
-        /// Constrói chave de cooldown ESTRUTURADA em long (64 bits):
-        ///   - bits 63..32: monsterNetId
-        ///   - bits 31..0:  attackerNetId
-        ///
-        /// Garante unicidade total para qualquer par (atacante, monstro), e
-        /// fica em um espaço de chave SEPARADO dos índices de skill (que são
-        /// passados como int via overload de ServerCheckAndSetCooldown).
+        /// Lê o NetworkInventory do atacante e resolve o perfil de arma efetivo.
+        /// Server-side: cliente não pode injetar perfil falso.
         /// </summary>
+        [Server]
+        private WeaponAttackProfile ResolveServerWeaponProfile(NetworkInventory inventory)
+        {
+            if (inventory == null)
+                return WeaponAttackProfile.Default(WeaponType.Unarmed);
+
+            string weaponId = inventory.ServerGetEquipped(EquipmentSlot.Weapon);
+            if (string.IsNullOrEmpty(weaponId))
+                return WeaponAttackProfile.Default(WeaponType.Unarmed);
+
+            var item = ItemDatabase.Instance?.GetItem(weaponId);
+            if (item == null || !item.IsWeapon)
+                return WeaponAttackProfile.Default(WeaponType.Unarmed);
+
+            return item.GetEffectiveAttackProfile();
+        }
+
+        /// <summary>
+        /// Spawna um projétil no servidor que vai impactar o monstro.
+        /// </summary>
+        [Server]
+        private void SpawnAttackProjectile(NetworkPlayer attacker, WeaponAttackProfile profile,
+                                           float damage, bool crit)
+        {
+            var prefab = RPGNetworkManager.singleton?.GetProjectilePrefab(profile.Type);
+            if (prefab == null)
+            {
+                Debug.LogWarning($"[Combat] Sem prefab de projétil para {profile.Type}. " +
+                                 "Aplicando dano instantâneo como fallback.");
+                RpcShowDamage(damage, crit, ImpactPoint);
+                ApplyDamageInternal(damage);
+                return;
+            }
+
+            // Spawna na frente do atacante, ~altura do peito
+            Vector3 spawnPos = attacker.transform.position
+                             + attacker.transform.forward * 0.5f
+                             + Vector3.up * 1.2f;
+            Quaternion spawnRot = Quaternion.LookRotation(
+                (ImpactPoint - spawnPos).normalized);
+
+            var go = Instantiate(prefab, spawnPos, spawnRot);
+            var proj = go.GetComponent<Projectile>();
+            if (proj == null)
+            {
+                Debug.LogError("[Combat] Projétil prefab não tem componente Projectile!");
+                Destroy(go);
+                RpcShowDamage(damage, crit, ImpactPoint);
+                ApplyDamageInternal(damage);
+                return;
+            }
+
+            NetworkServer.Spawn(go);
+            proj.ServerInitialize(this, profile.ProjectileSpeed, damage, crit);
+        }
+
         private static long BuildBasicAttackCooldownKey(uint attackerNetId, uint monsterNetId)
         {
             return ((long)monsterNetId << 32) | attackerNetId;
@@ -998,7 +1117,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Morte e respawn
+        // Morte e respawn (inalterados)
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
@@ -1084,10 +1203,6 @@ namespace RPG.Network
             ServerReset();
         }
 
-        // ══════════════════════════════════════════════════════════════════
-        // NavMesh helpers
-        // ══════════════════════════════════════════════════════════════════
-
         private bool TryGetRandomAreaPoint(Vector3 center, float radius, out Vector3 result)
         {
             for (int i = 0; i < 15; i++)
@@ -1102,7 +1217,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // ClientRpcs
+        // ClientRpcs (inalterados)
         // ══════════════════════════════════════════════════════════════════
 
         [ClientRpc]
@@ -1141,7 +1256,6 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcOnDied(Vector3 pos)
         {
-            // Servidor dedicado puro não tem UI nem clientes locais
             if (Application.isBatchMode) return;
 
             OnDeselected();

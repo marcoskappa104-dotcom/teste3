@@ -4,52 +4,39 @@ using Mirror;
 using RPG.Character;
 using RPG.UI;
 using RPG.Network;
+using RPG.Data;
 
 namespace RPG.Combat
 {
     /// <summary>
-    /// Auto-ataque básico (sem custo de mana, sem cooldown explícito — apenas ASPD).
+    /// Auto-ataque básico, baseado no PERFIL DA ARMA EQUIPADA.
     ///
-    /// Disparado por duplo-clique em um monstro. Persegue até entrar no range,
-    /// para, ataca em intervalos de 1/ASPD, e cancela se o alvo morrer ou mudar.
+    /// === COMO FUNCIONA ===
+    ///   1. Cliente lê o WeaponAttackProfile do item na slot Weapon do inventário.
+    ///   2. O perfil determina: range, melee/projétil, físico/mágico, multiplicador,
+    ///      animação, custo de mana, velocidade.
+    ///   3. Cliente persegue até entrar em range, ataca em intervalos de
+    ///      (1/ASPD) * profile.AttackIntervalMultiplier.
+    ///   4. Cmd enviado ao servidor inclui o range pretendido — servidor compara
+    ///      contra o range do perfil real da arma equipada (que ele conhece),
+    ///      então cliente NÃO pode reportar range maior que tem.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (Lote 1 — robustez) ===
+    /// === REATIVIDADE ===
+    ///   - Inscreve-se em OnEquipmentChanged. Trocar de arma durante auto-ataque
+    ///     atualiza o perfil ativo em tempo real (com cancel suave se a nova
+    ///     arma não tem range).
     ///
-    ///   1. SUBSCRIÇÃO EM OnDeathChanged:
-    ///      Antes, se o player morresse durante auto-ataque, _autoAttacking
-    ///      ficava true. Ao reviver, o sistema retomava ataque contra alvo
-    ///      stale. Agora, OnDeathChanged dispara CancelAutoAttack() e
-    ///      mantém o estado consistente.
-    ///
-    ///   2. SUBSCRIÇÃO EM OnTargetChanged:
-    ///      Se outro sistema (NetworkPlayerController) limpar o alvo (ex:
-    ///      jogador clicou no chão para mover), o auto-ataque é cancelado
-    ///      automaticamente. Antes, a detecção dependia de IsCurrentTargetStillSame
-    ///      checando a cada Update.
-    ///
-    ///   3. CLEANUP COMPLETO EM OnDisable / OnDestroy:
-    ///      Desinscreve dos eventos do PlayerEntity para evitar memory leaks
-    ///      e callbacks órfãos em cleanup de cena.
-    ///
-    ///   4. ATTACK_TIMER RESETADO EM SOFT CANCEL:
-    ///      Antes, CancelAutoAttackSoft não tocava no _attackTimer. Em
-    ///      cenários de cancel+restart rápido o primeiro ataque podia
-    ///      disparar imediatamente.
+    /// === MUDANÇAS PRINCIPAIS VS VERSÃO ANTERIOR ===
+    ///   - attackRange e attackInterval REMOVIDOS dos campos serializados:
+    ///     agora vêm do perfil da arma.
+    ///   - Suporte a projétil (Cmd separado: CmdBasicAttackRanged).
+    ///   - Suporte a custo de mana no básico (cajado, varinha).
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     [RequireComponent(typeof(NetworkIdentity))]
     public class BasicAttackSystem : NetworkBehaviour
     {
-        [Header("Ataque")]
-        [Tooltip("Distância máxima de ataque (m).")]
-        [SerializeField] private float attackRange = 2.5f;
-
-        [Tooltip("Intervalo fixo se useCharacterASPD = false.")]
-        [SerializeField] private float attackInterval = 1.2f;
-
-        [Tooltip("Se true, usa 1/ASPD do personagem como intervalo.")]
-        [SerializeField] private bool useCharacterASPD = true;
-
+        [Header("Configuração Geral")]
         [Tooltip("Janela para reconhecer duplo-clique (s).")]
         [SerializeField] private float doubleClickTime = 0.35f;
 
@@ -67,7 +54,7 @@ namespace RPG.Combat
         private const float RANGE_CHECK_MARGIN = 1.05f;
         private const float CHASE_STOP_DIST    = 0.15f;
         private const float IDLE_STOP_DIST     = 0.5f;
-        private const float MIN_INTERVAL       = 0.3f;
+        private const float MIN_INTERVAL       = 0.2f;
         private const float MAX_INTERVAL       = 3f;
         private const float ROTATION_SPEED     = 12f;
 
@@ -78,6 +65,7 @@ namespace RPG.Combat
         private NetworkPlayerController _controller;
         private SkillSystem             _skillSystem;
         private NetworkIdentity         _identity;
+        private NetworkInventory        _inventory;
 
         // ── Estado ─────────────────────────────────────────────────────────
         private NetworkMonsterEntity _attackTarget;
@@ -89,11 +77,16 @@ namespace RPG.Combat
         private float                _lastClickTime = -999f;
         private NetworkMonsterEntity _lastClickTarget;
 
+        // Perfil da arma em uso. Cacheado e refeito quando o inventário muda.
+        private WeaponAttackProfile _currentProfile;
+
         // ── Subscrições para cleanup ───────────────────────────────────────
         private bool _subscribedToPlayerEvents;
+        private bool _subscribedToInventoryEvents;
 
         public bool  IsAutoAttacking => _autoAttacking;
-        public float AttackRange     => attackRange;
+        public float AttackRange     => _currentProfile?.Range ?? 2.5f;
+        public WeaponAttackProfile CurrentProfile => _currentProfile;
 
         // ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -105,16 +98,22 @@ namespace RPG.Combat
             _controller  = GetComponent<NetworkPlayerController>();
             _skillSystem = GetComponent<SkillSystem>();
             _identity    = GetComponent<NetworkIdentity>();
+            _inventory   = GetComponent<NetworkInventory>();
+
+            _currentProfile = WeaponAttackProfile.Default(WeaponType.Unarmed);
         }
 
         public override void OnStartLocalPlayer()
         {
             SubscribeToPlayerEvents();
+            SubscribeToInventoryEvents();
+            RefreshWeaponProfile();
         }
 
         public override void OnStopClient()
         {
             UnsubscribeFromPlayerEvents();
+            UnsubscribeFromInventoryEvents();
             CancelAutoAttackSoft();
         }
 
@@ -126,6 +125,7 @@ namespace RPG.Combat
         private void OnDestroy()
         {
             UnsubscribeFromPlayerEvents();
+            UnsubscribeFromInventoryEvents();
         }
 
         private void SubscribeToPlayerEvents()
@@ -148,6 +148,20 @@ namespace RPG.Combat
             _subscribedToPlayerEvents = false;
         }
 
+        private void SubscribeToInventoryEvents()
+        {
+            if (_subscribedToInventoryEvents || _inventory == null) return;
+            _inventory.OnEquipmentChanged += OnEquipmentChanged;
+            _subscribedToInventoryEvents = true;
+        }
+
+        private void UnsubscribeFromInventoryEvents()
+        {
+            if (!_subscribedToInventoryEvents || _inventory == null) return;
+            _inventory.OnEquipmentChanged -= OnEquipmentChanged;
+            _subscribedToInventoryEvents = false;
+        }
+
         private void OnPlayerDeathChanged(bool isDead)
         {
             if (isDead && _autoAttacking)
@@ -159,9 +173,59 @@ namespace RPG.Combat
 
         private void OnPlayerTargetChanged(ITargetable newTarget)
         {
-            // Alvo mudou ou foi limpo externamente — cancela soft (sem mexer no agent).
             if (_autoAttacking && newTarget != (ITargetable)_attackTarget)
                 CancelAutoAttackSoft();
+        }
+
+        private void OnEquipmentChanged()
+        {
+            var oldProfile = _currentProfile;
+            RefreshWeaponProfile();
+
+            // Se trocou pra um tipo de arma muito diferente durante combate,
+            // cancela o auto-ataque pra evitar comportamento inesperado.
+            // Ex: trocar arco por espada com alvo a 10m de distância.
+            if (_autoAttacking && oldProfile != null && _currentProfile != null
+                && _attackTarget != null)
+            {
+                float dist = Vector3.Distance(transform.position, _attackTarget.Position);
+                float newRange = _currentProfile.Range * RANGE_CHECK_MARGIN;
+                if (dist > newRange)
+                {
+                    Log($"Mudança de arma deixou alvo fora de range — perseguindo com novo range {_currentProfile.Range:0.0}.");
+                    // Não cancela; o loop principal vai reposicionar.
+                }
+            }
+        }
+
+        /// <summary>
+        /// Recalcula _currentProfile baseado no item no slot Weapon.
+        /// </summary>
+        private void RefreshWeaponProfile()
+        {
+            if (_inventory == null)
+            {
+                _currentProfile = WeaponAttackProfile.Default(WeaponType.Unarmed);
+                return;
+            }
+
+            string weaponId = _inventory.GetEquipped(EquipmentSlot.Weapon);
+            if (string.IsNullOrEmpty(weaponId))
+            {
+                _currentProfile = WeaponAttackProfile.Default(WeaponType.Unarmed);
+                Log("Sem arma — usando perfil Unarmed.");
+                return;
+            }
+
+            var item = ItemDatabase.Instance?.GetItem(weaponId);
+            if (item == null || !item.IsWeapon)
+            {
+                _currentProfile = WeaponAttackProfile.Default(WeaponType.Unarmed);
+                return;
+            }
+
+            _currentProfile = item.GetEffectiveAttackProfile();
+            Log($"Arma equipada: {item.DisplayName} ({_currentProfile.Type}, range {_currentProfile.Range:0.0})");
         }
 
         private void Update()
@@ -169,8 +233,6 @@ namespace RPG.Combat
             if (!isLocalPlayer) return;
             if (_player == null || !_player.IsInitialized) return;
 
-            // Belt-and-suspenders: se por algum motivo o evento de morte não
-            // chegou, garante consistência aqui também.
             if (_player.IsDead)
             {
                 if (_autoAttacking) CancelAutoAttack();
@@ -201,10 +263,6 @@ namespace RPG.Combat
             return false;
         }
 
-        /// <summary>
-        /// Cancela o auto-ataque E para o agent. Use quando realmente quiser
-        /// que o player pare (ex: morte, mudança de UI, alvo morto).
-        /// </summary>
         public void CancelAutoAttack()
         {
             if (!_autoAttacking) return;
@@ -212,18 +270,13 @@ namespace RPG.Combat
             StopAgentMovement();
         }
 
-        /// <summary>
-        /// Cancela apenas o ESTADO de auto-ataque, sem mexer no agent.
-        /// Use quando o player vai continuar se movendo (clique para mover
-        /// noutro ponto). Evita o jitter de parar-acelerar.
-        /// </summary>
         public void CancelAutoAttackSoft()
         {
             if (!_autoAttacking) return;
 
             _autoAttacking        = false;
             _attackTarget         = null;
-            _attackTimer          = 0f; // reset para não disparar imediatamente em restart
+            _attackTimer          = 0f;
             _lastChaseDestination = Vector3.positiveInfinity;
             Log("Auto-ataque cancelado (soft).");
         }
@@ -232,6 +285,9 @@ namespace RPG.Combat
 
         private void StartAutoAttack(NetworkMonsterEntity monster)
         {
+            // Garante que temos o perfil mais atual da arma equipada
+            RefreshWeaponProfile();
+
             _skillSystem?.CancelPendingWalkSoft();
             CancelAutoAttackSoft();
 
@@ -243,7 +299,7 @@ namespace RPG.Combat
             _player.SetTarget(monster);
             UIManager.Instance?.UpdateTargetPanel(monster);
 
-            Log($"Auto-ataque iniciado → {monster.DisplayName}");
+            Log($"Auto-ataque iniciado ({_currentProfile.Type}) → {monster.DisplayName}");
         }
 
         // ── Loop principal ─────────────────────────────────────────────────
@@ -266,19 +322,17 @@ namespace RPG.Combat
             }
 
             float dist           = Vector3.Distance(transform.position, _attackTarget.Position);
-            float effectiveRange = attackRange * RANGE_CHECK_MARGIN;
+            float range          = _currentProfile.Range;
+            float effectiveRange = range * RANGE_CHECK_MARGIN;
 
             if (dist > effectiveRange)
-                ChaseTarget();
+                ChaseTarget(range);
             else
                 AttackTarget();
         }
 
         private void AttackTarget()
         {
-            // Para o agent SUAVEMENTE — apenas se ainda tem path.
-            // Não chamamos StopAgentMovement aqui porque o agent já vai parar
-            // naturalmente ao chegar perto do alvo.
             if (_agent != null && _agent.isOnNavMesh && _agent.hasPath)
             {
                 _agent.ResetPath();
@@ -309,15 +363,12 @@ namespace RPG.Combat
                     ROTATION_SPEED * Time.deltaTime);
         }
 
-        private void ChaseTarget()
+        private void ChaseTarget(float weaponRange)
         {
             if (_attackTarget == null || _agent == null || !_agent.isOnNavMesh) return;
 
-            Vector3 destination = CalculateChaseDestination(_attackTarget.Position);
+            Vector3 destination = CalculateChaseDestination(_attackTarget.Position, weaponRange);
 
-            // Só chama SetDestination quando o destino mudou significativamente.
-            // SetDestination repetido com mesmo valor causa recálculo de path,
-            // que é o que produz o "stutter" durante perseguição.
             if (Vector3.Distance(destination, _lastChaseDestination) >= chaseRedirectThreshold)
             {
                 _agent.stoppingDistance = CHASE_STOP_DIST;
@@ -325,7 +376,6 @@ namespace RPG.Combat
                 _lastChaseDestination = destination;
             }
 
-            // Throttle do envio ao servidor
             if (Time.time - _lastMoveCmd >= moveCommandInterval)
             {
                 _lastMoveCmd = Time.time;
@@ -333,12 +383,12 @@ namespace RPG.Combat
             }
         }
 
-        private Vector3 CalculateChaseDestination(Vector3 targetPos)
+        private Vector3 CalculateChaseDestination(Vector3 targetPos, float weaponRange)
         {
             Vector3 toTarget = targetPos - transform.position;
             float   dist     = toTarget.magnitude;
 
-            float safeStopDist = attackRange * DEST_FRACTION;
+            float safeStopDist = weaponRange * DEST_FRACTION;
             if (dist <= safeStopDist * 0.95f)
                 return transform.position;
 
@@ -356,30 +406,35 @@ namespace RPG.Combat
         private void ExecuteBasicAttack()
         {
             if (IsTargetGone(_attackTarget)) return;
+            if (_identity == null) return;
 
-            _animator?.SetTrigger("Attack");
+            string animTrigger = !string.IsNullOrEmpty(_currentProfile.AnimTrigger)
+                ? _currentProfile.AnimTrigger
+                : "Attack";
+            _animator?.SetTrigger(animTrigger);
 
-            if (_identity != null)
-            {
-                _attackTarget.CmdBasicAttack(_identity.netId, attackRange);
-                Log($"CmdBasicAttack → {_attackTarget.DisplayName}");
-            }
+            // Servidor já conhece a arma e perfil — o cliente envia apenas
+            // a INTENÇÃO. O servidor valida e aplica.
+            //
+            // Cmd único para ambos tipos: servidor decide melee/projétil
+            // baseado no perfil real da arma equipada (não confia no cliente).
+            _attackTarget.CmdBasicAttack(_identity.netId, _currentProfile.Range);
+
+            Log($"CmdBasicAttack → {_attackTarget.DisplayName} (perfil: {_currentProfile.Type})");
         }
 
         // ── Helpers ────────────────────────────────────────────────────────
 
         private float GetAttackInterval()
         {
-            if (useCharacterASPD && _player.IsInitialized && _player.Stats != null)
-                return Mathf.Clamp(1f / Mathf.Max(0.1f, _player.Stats.ASPD),
-                                   MIN_INTERVAL, MAX_INTERVAL);
-            return attackInterval;
+            float baseInterval = 1.2f;
+            if (_player.IsInitialized && _player.Stats != null)
+                baseInterval = 1f / Mathf.Max(0.1f, _player.Stats.ASPD);
+
+            float modifier = _currentProfile?.AttackIntervalMultiplier ?? 1f;
+            return Mathf.Clamp(baseInterval * modifier, MIN_INTERVAL, MAX_INTERVAL);
         }
 
-        /// <summary>
-        /// Para o agent de forma suave: limpa path e ajusta stoppingDistance.
-        /// NÃO zera velocity (deixa o brake natural desacelerar).
-        /// </summary>
         private void StopAgentMovement()
         {
             if (_agent == null || !_agent.isOnNavMesh) return;
@@ -408,11 +463,23 @@ namespace RPG.Combat
 #if UNITY_EDITOR
         private void OnDrawGizmosSelected()
         {
-            Gizmos.color = new Color(1f, 0.5f, 0f, 0.4f);
-            Gizmos.DrawWireSphere(transform.position, attackRange);
+            float r = _currentProfile?.Range ?? 2.5f;
+
+            // Cor por categoria visual
+            Color rangeColor = new Color(1f, 0.5f, 0f, 0.4f);
+            if (_currentProfile != null)
+            {
+                if (_currentProfile.UsesProjectile && !_currentProfile.IsPhysical)
+                    rangeColor = new Color(0.3f, 0.6f, 1f, 0.4f); // mágico = azul
+                else if (_currentProfile.UsesProjectile)
+                    rangeColor = new Color(0.7f, 1f, 0.3f, 0.4f); // arco = verde
+            }
+
+            Gizmos.color = rangeColor;
+            Gizmos.DrawWireSphere(transform.position, r);
 
             Gizmos.color = new Color(0f, 1f, 0.5f, 0.25f);
-            Gizmos.DrawWireSphere(transform.position, attackRange * DEST_FRACTION);
+            Gizmos.DrawWireSphere(transform.position, r * DEST_FRACTION);
         }
 #endif
     }

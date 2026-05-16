@@ -23,6 +23,14 @@ namespace RPG.Data
     /// <summary>
     /// ScriptableObject que define um item do jogo.
     /// O ItemId é a chave de banco — NUNCA altere após o item estar em uso por jogadores.
+    ///
+    /// === MUDANÇAS DESTA VERSÃO ===
+    ///
+    ///   ARMAS AGORA TÊM PERFIL DE ATAQUE BÁSICO:
+    ///   - WeaponType define a categoria (Sword/Bow/Staff/etc).
+    ///   - UseCustomAttackProfile + CustomAttackProfile permite override
+    ///     fino por item (ex: arco lendário com range maior).
+    ///   - GetEffectiveAttackProfile() é o que o BasicAttackSystem consulta.
     /// </summary>
     [CreateAssetMenu(menuName = "RPG/Item Data", fileName = "Item_New")]
     public class ItemData : ScriptableObject
@@ -56,6 +64,18 @@ namespace RPG.Data
         [Header("Equipment (use apenas se Type == Equipment)")]
         [Tooltip("Slot onde o item se encaixa. Ring1/Ring2 e Earring1/Earring2 são intercambiáveis.")]
         public EquipmentSlot EquipSlot = EquipmentSlot.None;
+
+        // ── ARMA (use apenas se EquipSlot == Weapon) ───────────────────────
+        [Header("Arma (use apenas se EquipSlot == Weapon)")]
+        [Tooltip("Categoria da arma. Define o ataque básico (range/projétil/dano).")]
+        public WeaponType WeaponType = WeaponType.Unarmed;
+
+        [Tooltip("Se true, usa o CustomAttackProfile abaixo em vez do perfil padrão da categoria.\n" +
+                 "Útil para armas únicas (arco lendário com range maior, etc).")]
+        public bool UseCustomAttackProfile = false;
+
+        [Tooltip("Override do perfil padrão. Só usado se UseCustomAttackProfile = true.")]
+        public WeaponAttackProfile CustomAttackProfile = new WeaponAttackProfile();
 
         [Header("Bônus de Atributo")]
         public int BonusSTR;
@@ -99,11 +119,28 @@ namespace RPG.Data
         public bool IsEquipment  => Type == ItemType.Equipment && EquipSlot != EquipmentSlot.None;
         public bool IsConsumable => Type == ItemType.Consumable && (HealAmount > 0f || ManaAmount > 0f);
 
-        /// <summary>
-        /// True para tipos que podem se acumular em pilha (Consumable e Misc).
-        /// PowerGems e equipamentos são sempre quantidade 1.
-        /// </summary>
+        /// <summary>True se o item é uma arma equipável (EquipSlot == Weapon).</summary>
+        public bool IsWeapon => IsEquipment && EquipSlot == EquipmentSlot.Weapon;
+
         public bool IsStackable  => Type == ItemType.Consumable || Type == ItemType.Misc;
+
+        /// <summary>
+        /// Retorna o perfil de ataque básico efetivo para esta arma.
+        /// Se UseCustomAttackProfile = true, retorna o custom; caso contrário,
+        /// o perfil padrão da categoria WeaponType.
+        ///
+        /// Se o item NÃO é arma, retorna o perfil de Unarmed (defensivo).
+        /// </summary>
+        public WeaponAttackProfile GetEffectiveAttackProfile()
+        {
+            if (!IsWeapon)
+                return WeaponAttackProfile.Default(WeaponType.Unarmed);
+
+            if (UseCustomAttackProfile && CustomAttackProfile != null)
+                return CustomAttackProfile;
+
+            return WeaponAttackProfile.Default(WeaponType);
+        }
 
         public Color RarityColor => Rarity switch
         {
@@ -125,7 +162,17 @@ namespace RPG.Data
             _                    => Rarity.ToString()
         };
 
-        /// <summary>True se este equipamento concede algum bônus relevante.</summary>
+        public string WeaponTypeDisplayName => WeaponType switch
+        {
+            WeaponType.Unarmed => "Soco",
+            WeaponType.Sword   => "Espada",
+            WeaponType.Dagger  => "Adaga",
+            WeaponType.Bow     => "Arco",
+            WeaponType.Staff   => "Cajado",
+            WeaponType.Wand    => "Varinha",
+            _ => WeaponType.ToString()
+        };
+
         public bool HasAnyBonus()
         {
             if (!IsEquipment) return false;
@@ -156,6 +203,11 @@ namespace RPG.Data
                 Requirements.MinLevel = 1;
 
             if (MaxDurability < 0) MaxDurability = 0;
+
+            // Aviso se uma arma esquecer de configurar WeaponType
+            if (IsWeapon && WeaponType == WeaponType.Unarmed)
+                Debug.LogWarning($"[ItemData] '{name}' é arma mas WeaponType=Unarmed. " +
+                                 "Você quis configurar Sword/Bow/Staff/etc?");
         }
 #endif
     }

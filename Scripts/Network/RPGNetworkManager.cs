@@ -11,27 +11,16 @@ namespace RPG.Network
     /// <summary>
     /// NetworkManager especializado para o RPG.
     ///
-    /// Responsabilidades:
-    ///   - Inicializa ServerAuthManager e registra handlers.
-    ///   - Aguarda MsgClientSceneReady antes de spawnar o player (garante NavMesh pronto).
-    ///   - Mantém spawn points por raça.
-    ///   - Registra prefabs de monstro/itens uma única vez.
+    /// === MUDANÇAS DESTA VERSÃO (sistema de armas) ===
     ///
-    /// === MUDANÇAS DESTA VERSÃO (Lote 3 — robustez) ===
+    ///   1. PROJECTILE PREFABS POR WeaponType:
+    ///      Adicionado dicionário projectilePrefabs com lookup O(1).
+    ///      NetworkMonsterEntity consulta via GetProjectilePrefab(WeaponType)
+    ///      para spawnar projétil correto (arco → flecha, cajado → missile).
     ///
-    ///   1. SCENE CHANGE LIMPA PENDING SPAWNS:
-    ///      Antes, OnServerSceneChanged só re-registrava prefabs. Mas se a
-    ///      cena mudou enquanto havia _pendingSpawns, eles ficavam apontando
-    ///      para connectionIds de uma cena anterior. Agora limpamos.
-    ///
-    ///   2. VALIDAÇÃO DE PREFAB COM AVISO ESPECÍFICO:
-    ///      RegisterSpawnablePrefabs agora loga o nome do prefab problemático
-    ///      em vez de uma mensagem genérica — facilita debug.
-    ///
-    ///   3. CLEANUP DE COROUTINES PENDENTES NO SERVER STOP:
-    ///      Antes, se o servidor parasse com spawn coroutines ativas, elas
-    ///      ficavam tentando spawnar contra um NetworkServer fechado. Agora
-    ///      OnStopServer cancela todas.
+    ///   2. PROJECTILE PREFABS AUTO-REGISTRADOS:
+    ///      Adicionados a spawnablePrefabs na inicialização (sem precisar
+    ///      adicionar manualmente em ambos os lugares).
     /// </summary>
     public class RPGNetworkManager : NetworkManager
     {
@@ -56,6 +45,23 @@ namespace RPG.Network
         [Tooltip("Prefabs de monstros e itens (precisam ter NetworkIdentity).")]
         [SerializeField] private List<GameObject> spawnablePrefabs = new List<GameObject>();
 
+        [System.Serializable]
+        public class WeaponProjectileEntry
+        {
+            [Tooltip("Categoria de arma à qual este projétil se aplica.")]
+            public WeaponType WeaponType = WeaponType.Bow;
+
+            [Tooltip("Prefab do projétil. Precisa de NetworkIdentity + Projectile.")]
+            public GameObject ProjectilePrefab;
+        }
+
+        [Header("Projéteis por Tipo de Arma")]
+        [Tooltip("Para cada WeaponType ranged, um prefab de projétil.\n" +
+                 "Bow → flecha. Staff → orb mágica grande. Wand → orb pequena.")]
+        [SerializeField] private List<WeaponProjectileEntry> projectilePrefabs = new();
+
+        private readonly Dictionary<WeaponType, GameObject> _projectileLookup = new();
+
         private struct PendingSpawn
         {
             public NetworkConnectionToClient Conn;
@@ -78,7 +84,48 @@ namespace RPG.Network
         public override void Start()
         {
             base.Start();
+            BuildProjectileLookup();
             RegisterSpawnablePrefabs();
+        }
+
+        private void BuildProjectileLookup()
+        {
+            _projectileLookup.Clear();
+            foreach (var entry in projectilePrefabs)
+            {
+                if (entry?.ProjectilePrefab == null) continue;
+                if (_projectileLookup.ContainsKey(entry.WeaponType))
+                {
+                    Debug.LogWarning($"[RPGNetworkManager] Duplicado: prefab de projétil " +
+                                     $"para {entry.WeaponType}. Mantendo primeiro.");
+                    continue;
+                }
+                if (entry.ProjectilePrefab.GetComponent<NetworkIdentity>() == null)
+                {
+                    Debug.LogError($"[RPGNetworkManager] Projétil '{entry.ProjectilePrefab.name}' " +
+                                   $"sem NetworkIdentity — ignorado.");
+                    continue;
+                }
+                if (entry.ProjectilePrefab.GetComponent<Projectile>() == null)
+                {
+                    Debug.LogError($"[RPGNetworkManager] Projétil '{entry.ProjectilePrefab.name}' " +
+                                   $"sem componente Projectile — ignorado.");
+                    continue;
+                }
+                _projectileLookup[entry.WeaponType] = entry.ProjectilePrefab;
+            }
+        }
+
+        /// <summary>
+        /// Retorna o prefab de projétil para uma categoria de arma.
+        /// null se não houver prefab configurado para essa categoria.
+        /// Chamado por NetworkMonsterEntity durante spawn de projétil.
+        /// </summary>
+        [Server]
+        public GameObject GetProjectilePrefab(WeaponType weaponType)
+        {
+            _projectileLookup.TryGetValue(weaponType, out var prefab);
+            return prefab;
         }
 
         public override void OnStartServer()
@@ -101,8 +148,6 @@ namespace RPG.Network
 
         public override void OnStopServer()
         {
-            // Cancela TODAS as spawn coroutines pendentes — sem isso, podem
-            // tentar AddPlayerForConnection contra um NetworkServer já fechado.
             foreach (var kv in _spawnCoroutines)
                 if (kv.Value != null) StopCoroutine(kv.Value);
             _spawnCoroutines.Clear();
@@ -128,14 +173,13 @@ namespace RPG.Network
         {
             base.OnServerSceneChanged(sceneName);
 
-            // Limpa estado pendente — connectionIds anteriores não são mais válidos
             foreach (var kv in _spawnCoroutines)
                 if (kv.Value != null) StopCoroutine(kv.Value);
             _spawnCoroutines.Clear();
             _pendingSpawns.Clear();
 
-            // Re-registra ao trocar de cena (novas dungeons podem ter prefabs únicos)
             _prefabsRegistered = false;
+            BuildProjectileLookup();
             RegisterSpawnablePrefabs();
         }
 
@@ -163,10 +207,7 @@ namespace RPG.Network
             base.OnServerDisconnect(conn);
         }
 
-        public override void OnServerAddPlayer(NetworkConnectionToClient conn)
-        {
-            // Spawn é controlado por ServerAuthManager via SpawnPlayerForConnection
-        }
+        public override void OnServerAddPlayer(NetworkConnectionToClient conn) { }
 
         public override void OnClientConnect()
         {
@@ -245,7 +286,6 @@ namespace RPG.Network
 
             Vector3 spawnPos = GetSpawnPositionForRace(charData.Race, charData);
 
-            // Espera o NavMesh disponibilizar a posição
             float elapsed = 0f;
             while (elapsed < SPAWN_NAVMESH_TIMEOUT)
             {
@@ -299,10 +339,6 @@ namespace RPG.Network
             }
         }
 
-        // ══════════════════════════════════════════════════════════════════
-        // Spawn points
-        // ══════════════════════════════════════════════════════════════════
-
         public Vector3 GetSpawnPositionForRace(CharacterRace race, CharacterData charData)
         {
             var saved = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
@@ -330,32 +366,45 @@ namespace RPG.Network
             int registered = 0;
             int skipped    = 0;
 
+            // Prefabs de monstros/itens da lista principal
             foreach (var prefab in spawnablePrefabs)
             {
-                if (prefab == null)
-                {
-                    skipped++;
-                    continue;
-                }
+                if (prefab == null) { skipped++; continue; }
+                if (!TryRegisterPrefab(prefab)) continue;
+                registered++;
+            }
 
-                var identity = prefab.GetComponent<NetworkIdentity>();
-                if (identity == null)
-                {
-                    Debug.LogError($"[RPGNetworkManager] '{prefab.name}' sem NetworkIdentity — ignorado.");
-                    continue;
-                }
-                if (!NetworkClient.prefabs.ContainsKey(identity.assetId))
-                {
-                    NetworkClient.RegisterPrefab(prefab);
+            // Prefabs de projéteis (auto-registro — usuário não precisa
+            // duplicar entradas nas duas listas)
+            foreach (var entry in projectilePrefabs)
+            {
+                if (entry?.ProjectilePrefab == null) continue;
+                if (TryRegisterPrefab(entry.ProjectilePrefab))
                     registered++;
-                }
             }
 
             _prefabsRegistered = true;
             if (registered > 0)
-                Debug.Log($"[RPGNetworkManager] {registered} prefabs registrados.");
+                Debug.Log($"[RPGNetworkManager] {registered} prefabs registrados " +
+                          $"(incluindo {_projectileLookup.Count} projéteis).");
             if (skipped > 0)
                 Debug.LogWarning($"[RPGNetworkManager] {skipped} entradas nulas em spawnablePrefabs.");
+        }
+
+        private bool TryRegisterPrefab(GameObject prefab)
+        {
+            var identity = prefab.GetComponent<NetworkIdentity>();
+            if (identity == null)
+            {
+                Debug.LogError($"[RPGNetworkManager] '{prefab.name}' sem NetworkIdentity — ignorado.");
+                return false;
+            }
+            if (!NetworkClient.prefabs.ContainsKey(identity.assetId))
+            {
+                NetworkClient.RegisterPrefab(prefab);
+                return true;
+            }
+            return false; // já estava registrado
         }
     }
 }

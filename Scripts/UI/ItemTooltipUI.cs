@@ -9,24 +9,13 @@ using System.Text;
 namespace RPG.UI
 {
     /// <summary>
-    /// ItemTooltipUI — tooltip de item com seções dinâmicas (stats, requisitos,
-    /// skill, consumível).
+    /// ItemTooltipUI — tooltip com seções dinâmicas.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (Lote 5 — polish) ===
-    ///
-    ///   1. STRING BUILDER COMPARTILHADO:
-    ///      Cada chamada de PopulateContent criava 4 StringBuilders novos
-    ///      (um por seção). Trocado por um _sharedSB reutilizado, com
-    ///      Clear() entre cada uso. Reduz GC pressure quando o jogador
-    ///      varre o inventário rapidamente.
-    ///
-    ///   2. POSITIONBYCURSOR COM CORREÇÃO DE WORLD SPACE:
-    ///      Antes, em modo ScreenSpaceCamera, mousePos.z era 0 (caía no near
-    ///      clip plane). Agora usamos canvas.planeDistance como z.
-    ///
-    ///   3. CLEAN UNUSED USINGS:
-    ///      Mantido `using Mirror;` (necessário para NetworkClient.localPlayer
-    ///      em TryGetLocalPlayerStats), mas adicionado comentário explicando.
+    /// === MUDANÇAS DESTA VERSÃO (sistema de armas) ===
+    ///   - Nova seção "Arma" exibida para itens com IsWeapon = true.
+    ///     Mostra: tipo (Espada/Arco/Cajado), range, físico/mágico,
+    ///     multiplicador de dano, custo de mana (se houver).
+    ///   - O StringBuilder compartilhado continua sendo reutilizado.
     /// </summary>
     public class ItemTooltipUI : MonoBehaviour
     {
@@ -40,6 +29,11 @@ namespace RPG.UI
         [SerializeField] private TMP_Text _itemNameText;
         [SerializeField] private TMP_Text _itemTypeText;
         [SerializeField] private TMP_Text _descriptionText;
+
+        [Header("Seção de Arma (Equipment + IsWeapon)")]
+        [Tooltip("Opcional. Se nulo, info de arma vai pro statsSection.")]
+        [SerializeField] private GameObject _weaponSection;
+        [SerializeField] private TMP_Text   _weaponText;
 
         [Header("Seção de Stats (Equipment)")]
         [SerializeField] private GameObject _statsSection;
@@ -58,10 +52,8 @@ namespace RPG.UI
         [SerializeField] private TMP_Text   _consumableText;
 
         [Header("Posicionamento")]
-        [Tooltip("Offset em pixels do tooltip relativo ao anchor (ou cursor, no overload sem anchor).")]
         [SerializeField] private Vector2 _offset = new Vector2(20f, 0f);
 
-        // StringBuilder compartilhado — evita alocação por sessão
         private readonly StringBuilder _sharedSB = new StringBuilder(256);
 
         private void Awake()
@@ -80,10 +72,6 @@ namespace RPG.UI
         // API pública
         // ══════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Mostra tooltip ancorado em um RectTransform específico (slot, ícone, etc).
-        /// Usado pelo InventorySlotUI e EquipmentSlotUI.
-        /// </summary>
         public void ShowForItem(ItemData item, RectTransform anchor)
         {
             if (item == null) { Hide(); return; }
@@ -93,10 +81,6 @@ namespace RPG.UI
             ApplyVisibility(true);
         }
 
-        /// <summary>
-        /// Overload sem anchor — posiciona próximo ao cursor.
-        /// Usado pelo PowerGemUI.OnGemSlotHoverEnter.
-        /// </summary>
         public void Show(ItemData item)
         {
             if (item == null) { Hide(); return; }
@@ -132,6 +116,7 @@ namespace RPG.UI
                 _descriptionText.gameObject.SetActive(!string.IsNullOrEmpty(item.Description));
             }
 
+            ShowWeaponSection(item);
             ShowStatsSection(item);
             ShowRequirementsSection(item);
             ShowSkillSection(item);
@@ -147,6 +132,62 @@ namespace RPG.UI
                 _canvasGroup.interactable   = false;
             }
             gameObject.SetActive(visible);
+        }
+
+        // ── Arma (nova seção) ──────────────────────────────────────────────
+
+        private void ShowWeaponSection(ItemData item)
+        {
+            // Se o painel dedicado não existir, integra no statsSection
+            GameObject target = _weaponSection;
+            TMP_Text   label  = _weaponText;
+            if (target == null)
+            {
+                // Sem painel dedicado — não exibe seção própria.
+                // (Pode-se mesclar no _statsText, mas para evitar string mixing
+                // deixamos só o painel dedicado.)
+                if (_weaponSection != null) _weaponSection.SetActive(false);
+                return;
+            }
+
+            if (!item.IsWeapon)
+            {
+                target.SetActive(false);
+                return;
+            }
+
+            var profile = item.GetEffectiveAttackProfile();
+
+            _sharedSB.Clear();
+            _sharedSB.AppendLine($"<b>{item.WeaponTypeDisplayName}</b>");
+
+            string damageColor = profile.IsPhysical ? "#FFB870" : "#80B0FF";
+            string damageType  = profile.IsPhysical ? "Físico"  : "Mágico";
+            _sharedSB.AppendLine($"<color={damageColor}>Tipo: {damageType}</color>");
+
+            _sharedSB.AppendLine($"Alcance: {profile.Range:0.#}m");
+
+            // Multiplicador de dano só vale a pena mostrar se != 1
+            if (!Mathf.Approximately(profile.DamageMultiplier, 1f))
+            {
+                string mod = profile.DamageMultiplier > 1f ? "#88FF88" : "#FFB870";
+                _sharedSB.AppendLine($"<color={mod}>Dano: {profile.DamageMultiplier:0.##}×</color>");
+            }
+
+            // Velocidade só se notavelmente diferente
+            if (profile.AttackIntervalMultiplier < 0.95f)
+                _sharedSB.AppendLine("<color=#88FF88>Velocidade: rápido</color>");
+            else if (profile.AttackIntervalMultiplier > 1.1f)
+                _sharedSB.AppendLine("<color=#FFB870>Velocidade: lento</color>");
+
+            if (profile.UsesProjectile)
+                _sharedSB.AppendLine("<color=#AACCFF>Ataque à distância</color>");
+
+            if (profile.ManaCost > 0f)
+                _sharedSB.AppendLine($"<color=#80B0FF>Custo: {profile.ManaCost:0.#} MP/ataque</color>");
+
+            if (label != null) label.text = _sharedSB.ToString().TrimEnd();
+            target.SetActive(true);
         }
 
         // ── Stats ──────────────────────────────────────────────────────────
@@ -264,15 +305,6 @@ namespace RPG.UI
                 ? $"<color=#88FF88>✓ {text}</color>"
                 : $"<color=#FF6666>✗ {text}</color>";
 
-        /// <summary>
-        /// Busca atributos totais do jogador local via NetworkClient.localPlayer
-        /// (daí o `using Mirror;` no topo) e NetworkPlayer (SyncVars BaseSTR +
-        /// AllocatedSTR + Level + RaceStr).
-        ///
-        /// Usa tipo TOTALMENTE QUALIFICADO RPG.Network.NetworkPlayer para evitar
-        /// ambiguidade com UnityEngine.NetworkPlayer (legacy, exposto por
-        /// `using Mirror;`).
-        /// </summary>
         private static bool TryGetLocalPlayerStats(out int level, out int str, out int agi, out int vit,
                                                    out int dex, out int intt, out int luk,
                                                    out CharacterRace race)
@@ -343,7 +375,7 @@ namespace RPG.UI
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Posicionamento
+        // Posicionamento (inalterado)
         // ══════════════════════════════════════════════════════════════════
 
         private void PositionByAnchor(RectTransform anchor)
@@ -360,16 +392,13 @@ namespace RPG.UI
             Vector3[] corners = new Vector3[4];
             anchor.GetWorldCorners(corners);
 
-            Vector3 worldPos = corners[2]; // top-right do anchor
+            Vector3 worldPos = corners[2];
             worldPos += new Vector3(_offset.x, _offset.y, 0f) * canvas.scaleFactor / 100f;
             _root.position = worldPos;
 
             ClampToScreen(canvas);
         }
 
-        /// <summary>
-        /// Posiciona o tooltip à direita do cursor com offset.
-        /// </summary>
         private void PositionByCursor()
         {
             if (_root == null) return;
@@ -387,9 +416,6 @@ namespace RPG.UI
             }
             else
             {
-                // ScreenSpaceCamera ou WorldSpace: converte via câmera do canvas.
-                // Usar planeDistance como z garante que o tooltip fique no plano
-                // correto (não no near clip da câmera).
                 Camera cam = canvas.worldCamera != null ? canvas.worldCamera : Camera.main;
                 if (cam != null)
                 {
@@ -427,6 +453,7 @@ namespace RPG.UI
 
         private static string GetTypeDisplay(ItemData item)
         {
+            if (item.IsWeapon)     return item.WeaponTypeDisplayName;
             if (item.IsEquipment)  return EquipmentSlotEx.DisplayName(item.EquipSlot);
             if (item.IsPowerGem)   return "Joia do Poder";
             if (item.IsConsumable) return "Consumível";
