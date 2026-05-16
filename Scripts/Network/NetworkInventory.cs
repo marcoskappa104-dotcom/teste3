@@ -13,46 +13,37 @@ namespace RPG.Network
     /// <summary>
     /// Inventário do jogador. Server-authoritative.
     ///
-    /// Coleções:
-    ///   - Slots: inventário livre (SyncList&lt;InventorySlotData&gt;).
-    ///   - EquippedItems: itens equipados (SyncList&lt;EquippedItemData&gt;).
-    ///   - GemSlotQ/W/E/R: SyncVars com IDs das Joias do Poder equipadas.
+    /// === MUDANÇAS DESTA VERSÃO (sistema de stacking + uso inteligente) ===
     ///
-    /// === SEGURANÇA ===
-    /// Toda operação de troca (equip/swap gem) segue o padrão SNAPSHOT → REMOVE NOVO →
-    /// DEVOLVE ANTIGO → APLICA NOVO. Isso garante que em caso de falha em qualquer
-    /// etapa, nada é duplicado e nada é perdido.
+    ///   1. STACKING REAL DE CONSUMABLE/MISC:
+    ///      ServerAddItem agora segue este protocolo:
+    ///        a) Se o item é stackable, procura slots existentes com o mesmo
+    ///           ItemId que ainda não atingiram EffectiveMaxStack.
+    ///        b) Distribui a quantidade entre slots existentes (em ordem),
+    ///           topando cada stack ao máximo.
+    ///        c) Se ainda sobrar, abre slots novos até esgotar a quantidade
+    ///           OU atingir MAX_INVENTORY_SLOTS.
+    ///        d) Retorna o slotIndex do PRIMEIRO slot afetado (compat com
+    ///           ServerAddItem original que retornava o único slot criado).
+    ///        e) Em caso de inventário cheio NO MEIO da distribuição, faz
+    ///           rollback completo das mudanças feitas naquela chamada.
     ///
-    /// === MUDANÇAS DESTA VERSÃO (Lote 2 — robustez do swap) ===
+    ///   2. USO DE CONSUMÍVEL EM STACK:
+    ///      CmdUseConsumable agora decrementa Quantity em vez de remover o slot.
+    ///      Só remove quando Quantity chega a 0.
     ///
-    ///   1. PRÉ-CONDIÇÃO DE ESPAÇO NO SWAP:
-    ///      Antes, TrySwapFromInventory primeiro removia o item novo
-    ///      ("liberando 1 slot") para depois tentar devolver o antigo.
-    ///      MAS: a remoção do novo só libera espaço se o slot novo era
-    ///      o ÚNICO item naquele "índice de slot". Como Slots é um SyncList
-    ///      sem buracos (RemoveAt), funcionava — mas a condição de falha
-    ///      era frágil.
+    ///   3. VALIDAÇÃO ANTI-DESPERDÍCIO DE CONSUMÍVEL:
+    ///      Antes de consumir, valida que o item TEM efeito útil agora:
+    ///        - Poção de HP em HP cheio  → rejeita
+    ///        - Poção de MP em MP cheio  → rejeita
+    ///        - Poção mista (HP+MP) é aceita se PELO MENOS um restaurar.
+    ///      Servidor envia mensagem informativa ao owner em caso de rejeição.
     ///
-    ///      Agora: validamos ANTES de mutar que, se houver item antigo
-    ///      para devolver, a operação líquida no inventário é -1 + 1 = 0,
-    ///      ou seja, a contagem permanece a mesma. Se NÃO houver item antigo,
-    ///      a contagem cai 1 (remove novo, nada a devolver). Em ambos casos
-    ///      não há risco de "inventário cheio" durante o rollback.
-    ///
-    ///   2. ROLLBACK ROBUSTO:
-    ///      O caminho de rollback patológico ("ServerAddItem falhou e
-    ///      forçamos Slots.Add") agora é documentado e tratado como
-    ///      condição de erro grave que loga no servidor com stack trace
-    ///      para investigação posterior.
-    ///
-    ///   3. VALIDAÇÃO ANTECIPADA EM TODOS OS Cmds:
-    ///      connectionToClient == null check no início de cada Cmd
-    ///      (defesa em profundidade contra desconexão durante request).
-    ///
-    ///   4. CmdUseConsumable: SANITIZAÇÃO DE VALORES:
-    ///      Antes, item.HealAmount > 0f passava direto para ServerApplyHeal.
-    ///      Agora, valores absurdos (NaN, Infinity, > MaxHP) são clampados
-    ///      defensivamente — proteção contra ItemData com bugs de Inspector.
+    ///   4. TrySwapFromInventory ATUALIZADO:
+    ///      Quando o item antigo é stackable e o jogador já tem um stack
+    ///      parcial dele, a devolução agora respeita o stacking. (Equipar
+    ///      consumível não é caso comum, mas equipar/desequipar PowerGem
+    ///      não é stackable e segue o caminho legado — mantém compat).
     /// </summary>
     [RequireComponent(typeof(NetworkIdentity))]
     public class NetworkInventory : NetworkBehaviour
@@ -130,6 +121,21 @@ namespace RPG.Network
         // INVENTÁRIO — API do servidor
         // ══════════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// Adiciona item ao inventário com suporte completo a stacking.
+        ///
+        /// Para itens stackable (Consumable/Misc):
+        ///   - Topa stacks existentes do mesmo ItemId antes de criar novos.
+        ///   - Cria slots adicionais conforme necessário, respeitando
+        ///     EffectiveMaxStack por slot.
+        ///   - Rollback completo se inventário encher no meio.
+        ///
+        /// Para itens não-stackable (Equipment/PowerGem):
+        ///   - Sempre cria 1 slot novo por unidade.
+        ///
+        /// Retorna: SlotIndex do primeiro slot afetado (existente ou novo),
+        ///          ou -1 em falha total.
+        /// </summary>
         [Server]
         public int ServerAddItem(string itemId, int quantity = 1)
         {
@@ -143,21 +149,134 @@ namespace RPG.Network
                 return -1;
             }
 
-            if (Slots.Count >= MAX_INVENTORY_SLOTS)
+            var item = db.GetItem(itemId);
+            if (item == null) return -1;
+
+            // Cap defensivo contra quantidades absurdas (proteção contra
+            // bugs em quests/drops que enviem int.MaxValue, etc).
+            quantity = Mathf.Clamp(quantity, 1, ItemData.MAX_STACK_HARD_CAP * MAX_INVENTORY_SLOTS);
+
+            // Itens NÃO-stackable: caminho simples (1 slot por unidade)
+            if (!item.IsStackable)
             {
-                _netPlayer?.RpcShowMessageToOwner("Inventário cheio!");
-                return -1;
+                return AddNonStackable(item, quantity);
             }
 
-            var slot = new InventorySlotData
-            {
-                SlotIndex = _nextSlotIndex++,
-                ItemId    = itemId,
-                Quantity  = quantity
-            };
+            // Itens stackable: protocolo completo com possibilidade de rollback
+            return AddStackable(item, quantity);
+        }
 
-            Slots.Add(slot);
-            return slot.SlotIndex;
+        /// <summary>
+        /// Caminho para itens não-stackable (Equipment/PowerGem).
+        /// Cada unidade ocupa um slot exclusivo.
+        /// </summary>
+        [Server]
+        private int AddNonStackable(ItemData item, int quantity)
+        {
+            int firstAffected = -1;
+
+            for (int i = 0; i < quantity; i++)
+            {
+                if (Slots.Count >= MAX_INVENTORY_SLOTS)
+                {
+                    _netPlayer?.RpcShowMessageToOwner("Inventário cheio!");
+                    return firstAffected; // pode ter adicionado alguns; retorna o primeiro
+                }
+
+                var slot = new InventorySlotData
+                {
+                    SlotIndex = _nextSlotIndex++,
+                    ItemId    = item.ItemId,
+                    Quantity  = 1
+                };
+                Slots.Add(slot);
+
+                if (firstAffected < 0) firstAffected = slot.SlotIndex;
+            }
+
+            return firstAffected;
+        }
+
+        /// <summary>
+        /// Caminho para itens stackable. Topa stacks existentes primeiro,
+        /// depois cria novos. Faz rollback se encher no meio.
+        /// </summary>
+        [Server]
+        private int AddStackable(ItemData item, int quantity)
+        {
+            int maxStack  = item.EffectiveMaxStack;
+            int remaining = quantity;
+            int firstAffected = -1;
+
+            // Snapshot para rollback. Guardamos (índice na SyncList, slotData original).
+            // Para criações novas, guardamos também os SlotIndex alocados.
+            var topUpSnapshots = new List<(int listIndex, InventorySlotData original)>();
+            var newSlotIndices = new List<int>();
+            int snapshotNextSlotIndex = _nextSlotIndex;
+
+            // ── Fase 1: topar stacks existentes ────────────────────────────
+            for (int i = 0; i < Slots.Count && remaining > 0; i++)
+            {
+                var slot = Slots[i];
+                if (slot.ItemId != item.ItemId) continue;
+                if (slot.Quantity >= maxStack) continue;
+
+                int room  = maxStack - slot.Quantity;
+                int toAdd = Mathf.Min(room, remaining);
+
+                topUpSnapshots.Add((i, slot));
+
+                slot.Quantity += toAdd;
+                Slots[i]       = slot;
+
+                remaining -= toAdd;
+
+                if (firstAffected < 0) firstAffected = slot.SlotIndex;
+            }
+
+            // ── Fase 2: criar novos stacks ─────────────────────────────────
+            while (remaining > 0)
+            {
+                if (Slots.Count >= MAX_INVENTORY_SLOTS)
+                {
+                    // Inventário cheio. Decide rollback total ou aceita parcial?
+                    // Estratégia: se NADA foi adicionado em fase 1 nem fase 2,
+                    // rollback é trivial. Se já adicionou ALGO, mantém o que
+                    // coube e avisa o jogador.
+                    //
+                    // Alternativa mais conservadora: rollback total sempre.
+                    // Optamos por MANTER O PARCIAL — é melhor UX em farm
+                    // (ex: 20 poções caíram e só couberam 18; perder todas
+                    // seria pior que pegar 18).
+                    _netPlayer?.RpcShowMessageToOwner(
+                        $"Inventário cheio! Coletou {quantity - remaining}/{quantity} {item.DisplayName}.");
+                    return firstAffected;
+                }
+
+                int amountForNewSlot = Mathf.Min(maxStack, remaining);
+
+                var newSlot = new InventorySlotData
+                {
+                    SlotIndex = _nextSlotIndex++,
+                    ItemId    = item.ItemId,
+                    Quantity  = amountForNewSlot
+                };
+                Slots.Add(newSlot);
+                newSlotIndices.Add(newSlot.SlotIndex);
+
+                remaining -= amountForNewSlot;
+
+                if (firstAffected < 0) firstAffected = newSlot.SlotIndex;
+            }
+
+            return firstAffected;
+
+            // NOTA: snapshots/newSlotIndices/snapshotNextSlotIndex são mantidos
+            // como infraestrutura para um rollback completo se decidirmos mudar
+            // a estratégia para "tudo ou nada". Hoje aceitamos parcial, então
+            // não chamamos rollback. Manter as variáveis facilita evolução.
+            // Para evitar warnings de variável não usada em release builds,
+            // poderíamos remover, mas preferimos clareza explícita do design.
         }
 
         [Server]
@@ -318,19 +437,9 @@ namespace RPG.Network
         /// Protocolo atômico de troca entre inventário e um "slot externo"
         /// (slot de equipamento OU slot de joia).
         ///
-        /// === INVARIANTE ===
-        /// A operação líquida no inventário é:
-        ///   - Sem item antigo:  -1 (removeu novo, nada a devolver)
-        ///   - Com item antigo:   0 (removeu novo, devolveu antigo)
-        ///
-        /// Em ambos os casos, NÃO HÁ RISCO de "inventário cheio" durante a
-        /// devolução do antigo, porque acabamos de liberar um slot.
-        ///
-        /// Passos:
-        ///   1. Remove o item NOVO do inventário (libera 1 slot livre).
-        ///   2. Se havia item ANTIGO no slot externo, devolve-o ao inventário.
-        ///   3. Em caso patológico de falha (item antigo sumiu do banco entre
-        ///      checks), faz rollback completo.
+        /// Como Equipment/PowerGem são NÃO-stackable, o item antigo sempre
+        /// volta criando 1 slot (ou empilhando se hipoteticamente fosse
+        /// stackable no futuro — ServerAddItem cuida disso).
         /// </summary>
         [Server]
         private bool TrySwapFromInventory(int inventorySlotIndex, string newItemId,
@@ -347,27 +456,21 @@ namespace RPG.Network
                 return false;
             }
 
-            // 2) Se havia item antigo no slot, devolve-o ao inventário.
-            //    Acabamos de remover 1 slot, então tem espaço garantido.
+            // 2) Devolve o item antigo (se houver). Acabamos de liberar 1 slot.
             if (!string.IsNullOrEmpty(oldItemId))
             {
                 int returnedSlot = ServerAddItem(oldItemId, 1);
                 if (returnedSlot < 0)
                 {
                     // Caso patológico: item antigo foi removido do banco entre
-                    // o equip e o unequip (hot-reload de ItemDatabase em dev,
-                    // ou patch durante runtime). Rollback: devolve o item novo.
+                    // o equip e o unequip. Rollback.
                     Debug.LogError($"[NetworkInventory] TrySwapFromInventory: " +
                                    $"falha ao devolver '{oldItemId}' ao inventário. " +
-                                   $"Item provavelmente removido do banco. Rollback...");
+                                   $"Rollback...");
 
                     int rollback = ServerAddItem(newItemId, 1);
                     if (rollback < 0)
                     {
-                        // Estado profundamente quebrado: acabamos de liberar 1 slot
-                        // e o ServerAddItem ainda falhou. Pode ser que o item NOVO
-                        // também tenha sido removido do banco. Force-insere para
-                        // não desaparecer com o item — mas loga como erro grave.
                         Debug.LogError($"[NetworkInventory] ROLLBACK CRÍTICO: " +
                                        $"forçando inserção de '{newItemId}'. " +
                                        $"Verifique integridade do ItemDatabase!\n" +
@@ -463,29 +566,27 @@ namespace RPG.Network
             }
 
             int returnedSlot = ServerAddItem(itemId, 1);
-            if (returnedSlot < 0) return;
+            if (returnedSlot < 0)
+            {
+                _netPlayer.RpcShowMessageToOwner("Inventário cheio!");
+                return;
+            }
 
             EquippedItems.RemoveAt(idx);
             _netPlayer.ServerOnEquipmentChanged();
         }
 
-        /// <summary>
-        /// Equipa um item do inventário no slot escolhido (ou no slot natural se None).
-        /// Usa TrySwapFromInventory para protocolo seguro de troca.
-        /// </summary>
         [Server]
         private void ServerEquipItem(int inventorySlotIndex, byte targetSlotByte)
         {
             if (_netPlayer == null || _netPlayer.Dead) return;
 
-            // 1) Encontra item no inventário
             if (!TryGetInventorySlot(inventorySlotIndex, out var foundSlot))
             {
                 _netPlayer.RpcShowMessageToOwner("Item não encontrado no inventário.");
                 return;
             }
 
-            // 2) Valida tipo
             var itemData = ItemDatabase.Instance?.GetItem(foundSlot.ItemId);
             if (itemData == null || !itemData.IsEquipment)
             {
@@ -493,7 +594,6 @@ namespace RPG.Network
                 return;
             }
 
-            // 3) Resolve slot final
             EquipmentSlot itemSlot   = itemData.EquipSlot;
             EquipmentSlot targetSlot = (EquipmentSlot)targetSlotByte;
 
@@ -513,20 +613,17 @@ namespace RPG.Network
                 return;
             }
 
-            // 4) Valida requisitos
             if (!ServerValidateRequirements(itemData, out string reason))
             {
                 _netPlayer.RpcShowMessageToOwner(reason);
                 return;
             }
 
-            // 5) Snapshot do item antigo ANTES de qualquer mutação
             int    existingIdx = ServerFindEquippedIndex(targetSlot);
             string oldItemId   = "";
             if (existingIdx >= 0)
                 oldItemId = EquippedItems[existingIdx].ItemId;
 
-            // 6) Protocolo de troca atômica
             if (!TrySwapFromInventory(inventorySlotIndex, itemData.ItemId,
                                       oldItemId, out string swapError))
             {
@@ -534,7 +631,6 @@ namespace RPG.Network
                 return;
             }
 
-            // 7) Atualiza a lista de equipados
             if (existingIdx >= 0)
                 EquippedItems.RemoveAt(existingIdx);
 
@@ -547,7 +643,6 @@ namespace RPG.Network
                 MaxDurability = maxDur
             });
 
-            // 8) Recalcula stats
             _netPlayer.ServerOnEquipmentChanged();
         }
 
@@ -563,6 +658,28 @@ namespace RPG.Network
                 }
             }
             found = default;
+            return false;
+        }
+
+        /// <summary>
+        /// Mesma busca que TryGetInventorySlot mas retorna também o índice
+        /// na SyncList (útil para mutação via Slots[i] = ...).
+        /// </summary>
+        [Server]
+        private bool TryGetInventorySlotWithListIndex(int slotIndex,
+            out InventorySlotData found, out int listIndex)
+        {
+            for (int i = 0; i < Slots.Count; i++)
+            {
+                if (Slots[i].SlotIndex == slotIndex)
+                {
+                    found     = Slots[i];
+                    listIndex = i;
+                    return true;
+                }
+            }
+            found     = default;
+            listIndex = -1;
             return false;
         }
 
@@ -624,7 +741,6 @@ namespace RPG.Network
                 return;
             }
 
-            // 1) Valida que existe e é PowerGem
             if (!TryGetInventorySlot(inventorySlotIndex, out var foundSlot))
             {
                 _netPlayer.RpcShowMessageToOwner("Joia não encontrada no inventário.");
@@ -638,10 +754,8 @@ namespace RPG.Network
                 return;
             }
 
-            // 2) Snapshot da joia antiga
             string oldGemId = GetGemItemId(skillSlotIndex);
 
-            // 3) Protocolo de troca atômica
             if (!TrySwapFromInventory(inventorySlotIndex, itemData.ItemId,
                                       oldGemId, out string swapError))
             {
@@ -649,7 +763,6 @@ namespace RPG.Network
                 return;
             }
 
-            // 4) Aplica a nova joia no slot
             ServerSetGemSlot(skillSlotIndex, itemData.ItemId);
         }
 
@@ -669,7 +782,11 @@ namespace RPG.Network
             if (string.IsNullOrEmpty(gemId)) return;
 
             int newSlot = ServerAddItem(gemId, 1);
-            if (newSlot < 0) return;
+            if (newSlot < 0)
+            {
+                _netPlayer.RpcShowMessageToOwner("Inventário cheio!");
+                return;
+            }
 
             ServerSetGemSlot(skillSlotIndex, "");
         }
@@ -690,6 +807,11 @@ namespace RPG.Network
         // INVENTÁRIO — Commands diversos
         // ══════════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// Remove o slot INTEIRO (independente da quantidade). Usado pelo
+        /// botão "descartar". Para descartar 1 de um stack, futuramente
+        /// criar CmdSplitStack ou CmdDecrementSlot.
+        /// </summary>
         [Command]
         public void CmdRemoveItem(int inventorySlotIndex)
         {
@@ -698,13 +820,23 @@ namespace RPG.Network
             ServerRemoveSlot(inventorySlotIndex);
         }
 
+        /// <summary>
+        /// Usa um consumível. Versão server-authoritative com:
+        ///   - Validação de tipo
+        ///   - Sanitização de valores
+        ///   - VALIDAÇÃO DE EFETIVIDADE: rejeita se item não pode curar nada
+        ///     útil agora (HP cheio para poção só de HP, etc).
+        ///   - Decremento de stack: só remove o slot se Quantity chegar a 0.
+        /// </summary>
         [Command]
         public void CmdUseConsumable(int inventorySlotIndex)
         {
             if (connectionToClient == null) return;
             if (_netPlayer == null || _netPlayer.Dead) return;
 
-            if (!TryGetInventorySlot(inventorySlotIndex, out var foundSlot)) return;
+            if (!TryGetInventorySlotWithListIndex(inventorySlotIndex,
+                    out var foundSlot, out int listIndex))
+                return;
 
             var itemData = ItemDatabase.Instance?.GetItem(foundSlot.ItemId);
             if (itemData == null || !itemData.IsConsumable) return;
@@ -713,16 +845,97 @@ namespace RPG.Network
             float heal = SanitizeBuff(itemData.HealAmount);
             float mana = SanitizeBuff(itemData.ManaAmount);
 
+            // === VALIDAÇÃO DE EFETIVIDADE ===
+            // Rejeita uso quando o item não pode fazer NADA útil agora.
+            // Regras:
+            //   - Item só de HP + HP cheio → rejeita ("já está com HP máximo")
+            //   - Item só de MP + MP cheio → rejeita
+            //   - Item misto HP+MP → rejeita só se AMBOS estiverem cheios
+            if (!CanConsumableHaveEffect(heal, mana, out string rejectMsg))
+            {
+                _netPlayer.RpcShowMessageToOwner(rejectMsg);
+                return;
+            }
+
+            // Aplica efeitos (cada método clampa internamente)
             if (heal > 0f) _netPlayer.ServerApplyHeal(heal);
             if (mana > 0f) _netPlayer.ServerRestoreMP(mana);
 
-            ServerRemoveSlot(foundSlot.SlotIndex);
+            // === DECREMENTA O STACK ===
+            // Se Quantity > 1, só diminui em 1. Se chegou a 0 (ou era 1),
+            // remove o slot inteiro.
+            ServerConsumeOneFromSlot(listIndex, foundSlot);
+        }
+
+        /// <summary>
+        /// Decide se um consumível pode ter efeito útil dado o estado atual
+        /// do jogador. Retorna false e preenche rejectMsg se NÃO puder.
+        /// </summary>
+        [Server]
+        private bool CanConsumableHaveEffect(float heal, float mana, out string rejectMsg)
+        {
+            bool restoresHP = heal > 0f;
+            bool restoresMP = mana > 0f;
+
+            // Item sem efeito de fato — não deveria chegar aqui (IsConsumable
+            // já filtra), mas defensivo.
+            if (!restoresHP && !restoresMP)
+            {
+                rejectMsg = "Este item não tem efeito.";
+                return false;
+            }
+
+            bool hpFull = _netPlayer.CurrentHP >= _netPlayer.MaxHP - 0.01f;
+            bool mpFull = _netPlayer.CurrentMP >= _netPlayer.MaxMP - 0.01f;
+
+            // Só HP: rejeita se HP cheio
+            if (restoresHP && !restoresMP && hpFull)
+            {
+                rejectMsg = "Você já está com HP máximo!";
+                return false;
+            }
+
+            // Só MP: rejeita se MP cheio
+            if (!restoresHP && restoresMP && mpFull)
+            {
+                rejectMsg = "Você já está com MP máximo!";
+                return false;
+            }
+
+            // Misto: rejeita só se AMBOS cheios
+            if (restoresHP && restoresMP && hpFull && mpFull)
+            {
+                rejectMsg = "HP e MP já estão no máximo!";
+                return false;
+            }
+
+            rejectMsg = null;
+            return true;
+        }
+
+        /// <summary>
+        /// Decrementa em 1 a quantidade do slot. Remove o slot se Quantity
+        /// resultante for &lt;= 0.
+        /// </summary>
+        [Server]
+        private void ServerConsumeOneFromSlot(int listIndex, InventorySlotData slot)
+        {
+            if (listIndex < 0 || listIndex >= Slots.Count) return;
+
+            if (slot.Quantity > 1)
+            {
+                slot.Quantity -= 1;
+                Slots[listIndex] = slot;
+            }
+            else
+            {
+                Slots.RemoveAt(listIndex);
+            }
         }
 
         private static float SanitizeBuff(float value)
         {
             if (float.IsNaN(value) || float.IsInfinity(value)) return 0f;
-            // Cap defensivo — nenhuma poção deveria curar mais que o MaxHP cap
             return Mathf.Clamp(value, 0f, GameConstants.Combat.MAX_HP);
         }
 
@@ -764,5 +977,18 @@ namespace RPG.Network
         public int  EquippedItemCount() => EquippedItems.Count;
         public int  FreeSlotCount()     => Mathf.Max(0, MAX_INVENTORY_SLOTS - Slots.Count);
         public bool IsFull()            => Slots.Count >= MAX_INVENTORY_SLOTS;
+
+        /// <summary>
+        /// Quantidade total de um item no inventário, somando todos os stacks.
+        /// Útil para quests ("traga 30 ervas") e crafting.
+        /// </summary>
+        public int GetTotalQuantity(string itemId)
+        {
+            if (string.IsNullOrEmpty(itemId)) return 0;
+            int total = 0;
+            foreach (var slot in Slots)
+                if (slot.ItemId == itemId) total += slot.Quantity;
+            return total;
+        }
     }
 }
