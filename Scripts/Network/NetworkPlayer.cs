@@ -921,16 +921,19 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcPlayerDied()
         {
+			if (_animator != null) _animator.SetBool("IsDead", true);
             if (!isLocalPlayer) return;
             if (_agent != null) { _agent.ResetPath(); _agent.isStopped = true; }
             GetComponent<NetworkPlayerController>()?.SetEnabled(false);
             _playerEntity?.OnServerDeath();
             DeathScreenUI.Show(this);
         }
+		
 
         [ClientRpc]
         private void RpcOnRespawned(Vector3 position, float hp, float maxHp, float mp, float maxMp)
         {
+		    if (_animator != null) _animator.SetBool("IsDead", false);
             if (!isLocalPlayer) return;
             if (_agent != null) { _agent.isStopped = false; _agent.Warp(position); }
             GetComponent<NetworkPlayerController>()?.SetEnabled(true);
@@ -1015,6 +1018,8 @@ namespace RPG.Network
             StopRegenLoop();
             if (_agent != null && _agent.isOnNavMesh) _agent.ResetPath();
 
+			IsMoving = false;
+			
             // Limpa cooldowns na morte — evita que o player respawne com
             // cooldowns velhos que travariam ataques nos primeiros segundos.
             // (Cooldowns de skill são intencionalmente mantidos: morrer não
@@ -1132,10 +1137,12 @@ namespace RPG.Network
             AttributeWindowUI.Instance?.OnFreePointsUpdated(newPoints);
         }
 
-        private void OnNetMovingChanged(bool _, bool v)
-        {
-            if (!isLocalPlayer) _animator?.SetBool("IsMoving", v);
-        }
+		private void OnNetMovingChanged(bool _, bool v)
+		{
+			// Aplica em TODOS os clientes, inclusive o local.
+			// O SyncVar é a única fonte de verdade pra animação de movimento.
+			_animator?.SetBool("IsMoving", v);
+		}			
 
         private void OnNetExpChanged(long _, long __)
         {
